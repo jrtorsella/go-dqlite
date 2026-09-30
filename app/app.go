@@ -642,6 +642,9 @@ func (a *App) run(ctx context.Context, options *options, join bool) {
 // Possibly change our own role at startup.
 func (a *App) maybePromoteOurselves(ctx context.Context, cli *client.Client, nodes []client.NodeInfo) error {
 	roles := a.makeRolesChanges(nodes)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	role := roles.Assume(a.id)
 	if role == -1 {
@@ -654,23 +657,46 @@ func (a *App) maybePromoteOurselves(ctx context.Context, cli *client.Client, nod
 	}
 
 	// Possibly try to promote another node as well if we've reached the 3
-	// node threshold. If we don't succeed in doing that, errors are
-	// ignored since the leader will eventually notice that don't have
-	// enough voters and will retry.
-	if role == client.Voter && roles.count(client.Voter, true) == 1 {
-		for node := range roles.State {
-			if node.ID == a.id || node.Role == client.Voter {
-				continue
-			}
-			if err := cli.Assign(ctx, node.ID, client.Voter); err == nil {
-				break
-			} else {
-				a.warn("promote %s from %s to voter: %v", node.Address, node.Role, err)
-			}
+	// node threshold. Only the best candidate is tried: if that fails, the
+	// error is ignored since the leader will eventually notice that there
+	// aren't enough voters and will retry.
+	if role == client.Voter && roles.count(client.Voter, true) == 1 && ctx.Err() == nil {
+		candidates := a.secondVoterCandidates(&roles)
+		if len(candidates) == 0 {
+			return nil
+		}
+		node := candidates[0]
+		if err := cli.Assign(ctx, node.ID, client.Voter); err != nil {
+			a.warn("promote %s from %s to voter: %v", node.Address, node.Role, err)
 		}
 	}
 
 	return nil
+}
+
+// Return the nodes that could be promoted to voter along with us, in order of
+// preference.
+func (a *App) secondVoterCandidates(roles *RolesChanges) []client.NodeInfo {
+	list := func(online bool) []client.NodeInfo {
+		nodes := []client.NodeInfo{}
+		for _, node := range append(roles.List(client.StandBy, online, nil), roles.List(client.Spare, online, nil)...) {
+			if node.ID != a.id {
+				nodes = append(nodes, node)
+			}
+		}
+		return nodes
+	}
+
+	candidates := list(true)
+	if len(candidates) > 0 {
+		voters := append(roles.List(client.Voter, true, nil), *roles.Get(a.id))
+		roles.SortCandidates(candidates, roles.FailureDomains(voters))
+		return candidates
+	}
+
+	// Nodes that we can't reach might still be online, and it's the
+	// leader that carries out the promotion.
+	return list(false)
 }
 
 // Check if any adjustment needs to be made to existing roles.
