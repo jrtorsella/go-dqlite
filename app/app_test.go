@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -1196,7 +1197,6 @@ func TestExternalConnWithPipe(t *testing.T) {
 	assert.Equal(t, client.Voter, cluster[2].Role)
 }
 
-
 // A joiner that can only reach the leader must not conclude that the other
 // voters are offline and promote itself.
 func TestExternalConnJoinerCannotReachVoters(t *testing.T) {
@@ -1248,7 +1248,6 @@ func TestExternalConnJoinerCannotReachVoters(t *testing.T) {
 	assert.NotEqual(t, client.Voter, cluster[3].Role)
 }
 
-
 // A joiner that becomes the second voter still promotes a third one, even if
 // it can't reach it.
 func TestExternalConnJoinerCannotReachSpare(t *testing.T) {
@@ -1298,6 +1297,35 @@ func TestExternalConnJoinerCannotReachSpare(t *testing.T) {
 
 	for _, node := range cluster {
 		assert.Equal(t, client.Voter, node.Role, node.Address)
+	}
+}
+
+// A connection handed over after the local node has stopped is closed instead
+// of crashing the process.
+func TestExternalConnAfterClose(t *testing.T) {
+	acceptCh := make(chan net.Conn)
+	dialFunc := func(_ context.Context, addr string) (net.Conn, error) {
+		client, server := net.Pipe()
+		acceptCh <- server
+		return client, nil
+	}
+
+	dir, cleanup := newDir(t)
+	defer cleanup()
+
+	a, err := app.New(dir, app.WithAddress("first"), app.WithExternalConn(dialFunc, acceptCh))
+	require.NoError(t, err)
+	require.NoError(t, a.Ready(context.Background()))
+	require.NoError(t, a.Close())
+
+	for i := 0; i < 3; i++ {
+		conn, server := net.Pipe()
+		acceptCh <- server
+
+		require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+		_, err := conn.Read(make([]byte, 1))
+		assert.Equal(t, io.EOF, err)
+		conn.Close()
 	}
 }
 

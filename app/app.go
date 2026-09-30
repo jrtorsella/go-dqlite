@@ -5,12 +5,14 @@ import (
 	"crypto/tls"
 	"database/sql"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/canonical/go-dqlite/v3"
@@ -290,28 +292,7 @@ func New(dir string, options ...Option) (app *App, err error) {
 	} else if o.Conn != nil {
 		go func() {
 			for remote := range o.Conn.acceptCh {
-
-				// keep forward compatible
-				_, isTcp := remote.(*net.TCPConn)
-				_, isTLS := remote.(*tls.Conn)
-
-				if isTcp || isTLS {
-					// Write the status line and upgrade header by hand since w.WriteHeader() would fail after Hijack().
-					data := []byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: dqlite\r\n\r\n")
-					n, err := remote.Write(data)
-					if err != nil || n != len(data) {
-						remote.Close()
-						panic(fmt.Errorf("failed to write connection header: %w", err))
-					}
-				}
-
-				local, err := net.Dial("unix", nodeBindAddress)
-				if err != nil {
-					remote.Close()
-					panic(fmt.Errorf("failed to connect to bind address %q: %w", nodeBindAddress, err))
-				}
-
-				go proxy(app.ctx, remote, local, nil)
+				go app.handleExternalConn(remote)
 			}
 		}()
 	}
@@ -319,6 +300,59 @@ func New(dir string, options ...Option) (app *App, err error) {
 	go app.run(ctx, o, joinFileExists)
 
 	return app, nil
+}
+
+// Hand a connection accepted by the user (see WithExternalConn) over to the
+// local dqlite node. Failures only affect this connection: it gets closed and
+// the peer will retry.
+func (a *App) handleExternalConn(remote net.Conn) {
+	// keep forward compatible
+	_, isTcp := remote.(*net.TCPConn)
+	_, isTLS := remote.(*tls.Conn)
+
+	if isTcp || isTLS {
+		// Write the status line and upgrade header by hand since w.WriteHeader() would fail after Hijack().
+		data := []byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: dqlite\r\n\r\n")
+		n, err := remote.Write(data)
+		if err == nil && n != len(data) {
+			err = io.ErrShortWrite
+		}
+		if err != nil {
+			remote.Close()
+			a.warn("write connection header to %s: %v", remote.RemoteAddr(), err)
+			return
+		}
+	}
+
+	local, err := a.dialBindAddress()
+	if err != nil {
+		remote.Close()
+		// Once we're closing, the node is expected to be gone.
+		if a.ctx.Err() == nil {
+			a.warn("connect to bind address %q: %v", a.nodeBindAddress, err)
+		}
+		return
+	}
+
+	proxy(a.ctx, remote, local, nil)
+}
+
+// Connect to the local dqlite node, retrying a few times if the listen
+// backlog is full.
+func (a *App) dialBindAddress() (net.Conn, error) {
+	delay := 10 * time.Millisecond
+	for attempt := 1; ; attempt++ {
+		conn, err := net.Dial("unix", a.nodeBindAddress)
+		if err == nil || !errors.Is(err, syscall.EAGAIN) || attempt == 5 {
+			return conn, err
+		}
+		select {
+		case <-a.ctx.Done():
+			return nil, err
+		case <-time.After(delay):
+			delay *= 2
+		}
+	}
 }
 
 // Handover transfers all responsibilities for this node (such has leadership
