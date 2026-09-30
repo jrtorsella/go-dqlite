@@ -42,6 +42,12 @@ func (p *Protocol) Call(ctx context.Context, request, response *Message) (err er
 		case *net.OpError:
 			p.netErr = err
 		}
+		// If the context is done the I/O was interrupted midway,
+		// so the connection is not usable anymore.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			err = errors.Wrap(err, ctxErr.Error())
+			p.netErr = err
+		}
 	}()
 
 	var budget time.Duration
@@ -51,6 +57,28 @@ func (p *Protocol) Call(ctx context.Context, request, response *Message) (err er
 		p.conn.SetDeadline(deadline)
 		budget = time.Until(deadline)
 		defer p.conn.SetDeadline(time.Time{})
+	}
+
+	// Honor ctx cancellation, if possible, by interrupting any blocked I/O.
+	if done := ctx.Done(); done != nil {
+		stop := make(chan struct{})
+		interrupted := make(chan bool, 1)
+		go func() {
+			select {
+			case <-done:
+				p.conn.SetDeadline(time.Now())
+				interrupted <- true
+			case <-stop:
+				interrupted <- false
+			}
+		}()
+		defer func() {
+			close(stop)
+			if <-interrupted && err == nil {
+				// The call completed anyway, keep the connection usable.
+				p.conn.SetDeadline(time.Time{})
+			}
+		}()
 	}
 
 	desc := requestDesc(request.mtype)
