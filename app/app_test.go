@@ -1196,6 +1196,111 @@ func TestExternalConnWithPipe(t *testing.T) {
 	assert.Equal(t, client.Voter, cluster[2].Role)
 }
 
+
+// A joiner that can only reach the leader must not conclude that the other
+// voters are offline and promote itself.
+func TestExternalConnJoinerCannotReachVoters(t *testing.T) {
+	addrs := []string{"first", "second", "third", "fourth"}
+	dialChannels := map[string]chan net.Conn{}
+	for _, addr := range addrs {
+		dialChannels[addr] = make(chan net.Conn)
+	}
+
+	dialFunc := func(_ context.Context, addr string) (net.Conn, error) {
+		client, server := net.Pipe()
+		dialChannels[addr] <- server
+		return client, nil
+	}
+
+	// Like peers that have not learned the joiner's certificate yet.
+	joinerDialFunc := func(ctx context.Context, addr string) (net.Conn, error) {
+		if addr == "second" || addr == "third" {
+			return nil, fmt.Errorf("403 Forbidden")
+		}
+		return dialFunc(ctx, addr)
+	}
+
+	for i, addr := range addrs[:3] {
+		options := []app.Option{app.WithAddress(addr), app.WithExternalConn(dialFunc, dialChannels[addr])}
+		if i > 0 {
+			options = append(options, app.WithCluster([]string{addrs[0]}))
+		}
+		a, cleanup := newAppWithNoTLS(t, options...)
+		defer cleanup()
+		require.NoError(t, a.Ready(context.Background()))
+	}
+
+	joiner, cleanup := newAppWithNoTLS(t, app.WithAddress(addrs[3]), app.WithExternalConn(joinerDialFunc, dialChannels[addrs[3]]), app.WithCluster([]string{addrs[0]}))
+	defer cleanup()
+	require.NoError(t, joiner.Ready(context.Background()))
+
+	cli, err := joiner.Leader(context.Background())
+	require.NoError(t, err)
+	defer cli.Close()
+
+	cluster, err := cli.Cluster(context.Background())
+	require.NoError(t, err)
+	require.Len(t, cluster, 4)
+
+	for _, node := range cluster[:3] {
+		assert.Equal(t, client.Voter, node.Role, node.Address)
+	}
+	assert.NotEqual(t, client.Voter, cluster[3].Role)
+}
+
+
+// A joiner that becomes the second voter still promotes a third one, even if
+// it can't reach it.
+func TestExternalConnJoinerCannotReachSpare(t *testing.T) {
+	addrs := []string{"first", "second", "third"}
+	dialChannels := map[string]chan net.Conn{}
+	for _, addr := range addrs {
+		dialChannels[addr] = make(chan net.Conn)
+	}
+
+	dialFunc := func(_ context.Context, addr string) (net.Conn, error) {
+		client, server := net.Pipe()
+		dialChannels[addr] <- server
+		return client, nil
+	}
+
+	joinerDialFunc := func(ctx context.Context, addr string) (net.Conn, error) {
+		if addr == "second" {
+			return nil, fmt.Errorf("403 Forbidden")
+		}
+		return dialFunc(ctx, addr)
+	}
+
+	apps := []*app.App{}
+	for i, addr := range addrs {
+		options := []app.Option{app.WithAddress(addr)}
+		if i == 2 {
+			options = append(options, app.WithExternalConn(joinerDialFunc, dialChannels[addr]))
+		} else {
+			options = append(options, app.WithExternalConn(dialFunc, dialChannels[addr]))
+		}
+		if i > 0 {
+			options = append(options, app.WithCluster([]string{addrs[0]}))
+		}
+		a, cleanup := newAppWithNoTLS(t, options...)
+		defer cleanup()
+		require.NoError(t, a.Ready(context.Background()))
+		apps = append(apps, a)
+	}
+
+	cli, err := apps[0].Leader(context.Background())
+	require.NoError(t, err)
+	defer cli.Close()
+
+	cluster, err := cli.Cluster(context.Background())
+	require.NoError(t, err)
+	require.Len(t, cluster, 3)
+
+	for _, node := range cluster {
+		assert.Equal(t, client.Voter, node.Role, node.Address)
+	}
+}
+
 func TestParallelNewApp(t *testing.T) {
 	t.Parallel()
 	for i := 0; i < 100; i++ {
