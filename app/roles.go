@@ -37,6 +37,12 @@ type RolesChanges struct {
 // algorithm might decide that the node should assume the Voter or Stand-By
 // role in case there's a shortage of them.
 //
+// The State is expected to reflect the point of view of the node itself, so a
+// nil metadata entry means that the node could not reach that peer, which is
+// not the same as the peer being offline. For that reason no role is assumed
+// if any current voter or stand-by is unreachable: the decision is left to
+// the leader's roles adjustment, which is based on the leader's own view.
+//
 // Return -1 in case no role change is needed.
 func (c *RolesChanges) Assume(id uint64) client.NodeRole {
 	// If the cluster is still too small, do nothing.
@@ -53,6 +59,12 @@ func (c *RolesChanges) Assume(id uint64) client.NodeRole {
 
 	// If we already have the Voter or StandBy role, there's nothing to do.
 	if node.Role == client.Voter || node.Role == client.StandBy {
+		return -1
+	}
+
+	// If we can't reach some voter or stand-by, we can't tell whether
+	// there's actually a shortage of them.
+	if c.count(client.Voter, false) > 0 || c.count(client.StandBy, false) > 0 {
 		return -1
 	}
 
