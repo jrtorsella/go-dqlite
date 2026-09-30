@@ -2,6 +2,10 @@ package protocol_test
 
 import (
 	"context"
+	"encoding/binary"
+	"io"
+	"io/ioutil"
+	"net"
 	"testing"
 	"time"
 
@@ -186,4 +190,76 @@ func newMessagePair(size1, size2 int) (protocol.Message, protocol.Message) {
 	message2.Init(size2)
 
 	return message1, message2
+}
+
+// A call without a deadline returns as soon as its context is canceled, even if
+// the server never replies, and the connection is not used again.
+func TestProtocol_CallCanceled(t *testing.T) {
+	conn, server := net.Pipe()
+	defer server.Close()
+
+	// Read requests but never reply.
+	go io.Copy(ioutil.Discard, server)
+
+	p := protocol.NewProtocol(protocol.VersionOne, conn)
+	defer p.Close()
+
+	request, response := newMessagePair(512, 512)
+	protocol.EncodeLeader(&request)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel)
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- p.Call(ctx, &request, &response) }()
+
+	select {
+	case err := <-errCh:
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), context.Canceled.Error())
+	case <-time.After(5 * time.Second):
+		t.Fatal("call was not interrupted by context cancellation")
+	}
+
+	err := p.Call(context.Background(), &request, &response)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), context.Canceled.Error())
+}
+
+// Canceling the context of a call that already completed leaves the connection
+// usable.
+func TestProtocol_CallCanceledAfterCompletion(t *testing.T) {
+	conn, server := net.Pipe()
+	defer server.Close()
+
+	// Reply to each request with an empty response.
+	go func() {
+		header := make([]byte, 8)
+		for {
+			if _, err := io.ReadFull(server, header); err != nil {
+				return
+			}
+			words := binary.LittleEndian.Uint32(header[0:])
+			if _, err := io.CopyN(ioutil.Discard, server, int64(words)*8); err != nil {
+				return
+			}
+			if _, err := server.Write(make([]byte, 8)); err != nil {
+				return
+			}
+		}
+	}()
+
+	p := protocol.NewProtocol(protocol.VersionOne, conn)
+	defer p.Close()
+
+	request, response := newMessagePair(512, 512)
+	protocol.EncodeLeader(&request)
+
+	for i := 0; i < 100; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		require.NoError(t, p.Call(ctx, &request, &response))
+		cancel()
+	}
+
+	require.NoError(t, p.Call(context.Background(), &request, &response))
 }
